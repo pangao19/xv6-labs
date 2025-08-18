@@ -31,15 +31,15 @@ procinit(void)
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
 
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // // Allocate a page for the process's kernel stack.
+      // // Map it high in memory, followed by an invalid
+      // // guard page.
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -101,6 +101,7 @@ allocproc(void)
     } else {
       release(&p->lock);
     }
+
   }
   return 0;
 
@@ -120,6 +121,19 @@ found:
     release(&p->lock);
     return 0;
   }
+
+  p->kama_kernelpgtbl=kama_kvminit_newpgtbl();
+      // Allocate a page for the process's kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  //初始化context是为了让进程被调度时，能从正确的起点（forkret）和正确的栈状态（空栈顶部）开始执行内核代码。
+  //内核栈（1 页大小）是进程在内核态运行时的专用栈，用于隔离用户态和内核态的栈操作，保证内核代码执行的安全性和正确性。
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int) (0));
+  kvmmap(p->kama_kernelpgtbl,va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -149,6 +163,15 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+
+    // 释放进程的内核栈
+  void* kstack_pa = (void*)kvmpa(p->kama_kernelpgtbl, p->kstack);
+  kfree(kstack_pa);
+  p->kstack = 0;
+  // 递归释放进程独享的页表，释放页表本身所占用的空间，但不释放页表指向的物理页
+  kama_kvm_free_kernelpgtbl(p->kama_kernelpgtbl);
+  p->kama_kernelpgtbl = 0;
+
   p->state = UNUSED;
 }
 
@@ -190,6 +213,7 @@ proc_pagetable(struct proc *p)
 void
 proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
+  //从用户页表中移除 “跳板页（TRAMPOLINE）” 的映射关系，但不释放其对应的物理内存
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
@@ -214,12 +238,16 @@ userinit(void)
   struct proc *p;
 
   p = allocproc();
+  //initcode 是一段用户态初始化代码（通常是汇编或机器码），并非进程 p 本身的一部分
   initproc = p;
   
   // allocate one user page and copy init's instructions
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  // 同步程序内存映射到进程内核页表中
+  //将 initcode 在用户页表中的映射关系同步到内核页表副本中
+  kama_kvmcopymappings(p->pagetable, p->kama_kernelpgtbl, 0, p->sz);      
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -242,12 +270,22 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
+  
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    uint64 newsz;
+    if((newsz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+        // 内核页表中的映射同步扩大
+    if (kama_kvmcopymappings(p->pagetable, p->kama_kernelpgtbl, sz, n) != 0) {
+        uvmdealloc(p->pagetable, newsz, sz);
+        return -1;
+    }
+    sz = newsz;
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uvmdealloc(p->pagetable, sz, sz + n);
+        // 内核页表中的映射同步缩小
+    sz = kama_kvmdealloc(p->kama_kernelpgtbl, sz, sz + n);
   }
   p->sz = sz;
   return 0;
@@ -268,7 +306,7 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0||kama_kvmcopymappings(np->pagetable,np->kama_kernelpgtbl,0,p->sz)<0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -458,7 +496,7 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
@@ -473,7 +511,15 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+                // 切换到进程独立的内核页表
+        w_satp(MAKE_SATP(p->kama_kernelpgtbl));
+        sfence_vma();       // 清除快表缓存，刷新TLB缓存，以确保地址转换表的更改生效
+
+         // 调度，执行进程
         swtch(&c->context, &p->context);
+
+        // 切换回全局内核页表
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

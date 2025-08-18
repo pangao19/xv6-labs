@@ -51,6 +51,8 @@ exec(char *path, char **argv)
     uint64 sz1;
     if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
       goto bad;
+    if(sz1>=PLIC)
+      goto bad;
     sz = sz1;
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
@@ -107,7 +109,12 @@ exec(char *path, char **argv)
     if(*s == '/')
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
-    
+  
+    // 清除内核页表中对程序内存的旧映射，然后重新建立映射
+    //0 作为起始地址，PGROUNDUP(oldsz) 是旧程序用户空间的高地址（远小于 PLIC_BASE），
+    //因此只会清除用户空间范围内的映射，不会触及设备映射的高地址区域。
+  uvmunmap(p->kama_kernelpgtbl, 0, PGROUNDUP(oldsz) / PGSIZE, 0);
+  kama_kvmcopymappings(pagetable, p->kama_kernelpgtbl, 0, sz);
   // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
@@ -116,7 +123,13 @@ exec(char *path, char **argv)
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+  if((p->pid)==1){
+    kama_vmprint(p->pagetable);
+  }
+
   return argc; // this ends up in a0, the first argument to main(argc, argv)
+
+
 
  bad:
   if(pagetable)
