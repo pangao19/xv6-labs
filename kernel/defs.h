@@ -63,7 +63,8 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
-
+void            kama_krefpage(void*);
+void*           kama_kcopy_n_deref(void*); 
 // log.c
 void            initlog(int, struct superblock*);
 void            log_write(struct buf*);
@@ -154,6 +155,8 @@ void            uartputc_sync(int);
 int             uartgetc(void);
 
 // vm.c
+int             kama_uvmcheckcowpage(uint64);
+int             kama_uvmcowcopy(uint64); 
 void            kvminit(void);
 void            kvminithart(void);
 uint64          kvmpa(uint64);
